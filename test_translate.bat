@@ -3,23 +3,19 @@ setlocal
 cd /d "%~dp0"
 
 if not exist "lm_env\Scripts\python.exe" (
-  echo [ERROR] 未找到虚拟环境: lm_env
-  pause
+  echo [ERROR] lm_env not found.
   exit /b 1
 )
 
-if not exist "artifacts\char_mapping_model.json" (
-  echo [ERROR] 未找到模型文件: artifacts\char_mapping_model.json
-  echo 请先运行训练脚本。
-  pause
+if not exist "artifacts\best_model.pt" (
+  echo [ERROR] model not found: artifacts\best_model.pt
+  echo Please run training first.
   exit /b 1
 )
 
-set "TEXT=创建一个新的记录"
-if not "%~1"=="" set "TEXT=%~1"
+set "TEXT=test"
+if not "%~1"=="" set "TEXT=%*"
 
-echo [RUN] 测试翻译文本: %TEXT%
-call "lm_env\Scripts\python.exe" translate.py --model-path artifacts/char_mapping_model.json --text "%TEXT%"
-echo.
-echo [DONE] 测试结束
-pause
+echo [RUN] test text: %TEXT%
+call "lm_env\Scripts\python.exe" translate.py --model-path artifacts/best_model.pt --text "%TEXT%" --device auto
+echo [DONE] test finished

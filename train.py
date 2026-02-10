@@ -1,10 +1,38 @@
 import argparse
 import json
+import math
 import random
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+
+PAD = "<pad>"
+BOS = "<bos>"
+EOS = "<eos>"
+UNK = "<unk>"
+SPECIAL_TOKENS = [PAD, BOS, EOS, UNK]
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def tokenize_zh(text: str) -> List[str]:
+    return [ch for ch in text.strip() if ch.strip()]
+
+
+def tokenize_ug(text: str) -> List[str]:
+    return [ch for ch in text.strip() if ch.strip()]
 
 
 def load_parallel_data(tsv_path: Path, max_samples: int = 0) -> List[Tuple[str, str]]:
@@ -26,132 +54,297 @@ def load_parallel_data(tsv_path: Path, max_samples: int = 0) -> List[Tuple[str, 
     return pairs
 
 
-def build_char_mapping(train_pairs: List[Tuple[str, str]]) -> Tuple[Dict[str, Dict[str, int]], str]:
-    mapping_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    tgt_char_counter: Counter = Counter()
-
-    for src_text, tgt_text in train_pairs:
-        src_chars = [ch for ch in src_text if ch.strip()]
-        tgt_chars = [ch for ch in tgt_text if ch.strip()]
-        if not src_chars or not tgt_chars:
-            continue
-
-        tgt_char_counter.update(tgt_chars)
-
-        if len(src_chars) == 1:
-            mapping_counts[src_chars[0]][tgt_chars[0]] += 1
-            continue
-
-        src_last = len(src_chars) - 1
-        tgt_last = len(tgt_chars) - 1
-        for i, s_ch in enumerate(src_chars):
-            j = round(i * tgt_last / src_last) if src_last > 0 else 0
-            t_ch = tgt_chars[min(max(j, 0), tgt_last)]
-            mapping_counts[s_ch][t_ch] += 1
-
-    default_tgt_char = tgt_char_counter.most_common(1)[0][0] if tgt_char_counter else ""
-    return mapping_counts, default_tgt_char
+def build_vocab(tokenized_texts: List[List[str]], min_freq: int = 1) -> dict:
+    counter: Counter = Counter()
+    for tokens in tokenized_texts:
+        counter.update(tokens)
+    vocab = {tok: idx for idx, tok in enumerate(SPECIAL_TOKENS)}
+    for tok, freq in counter.items():
+        if freq >= min_freq and tok not in vocab:
+            vocab[tok] = len(vocab)
+    return vocab
 
 
-def best_mapping(mapping_counts: Dict[str, Dict[str, int]]) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    for s_ch, tgt_count in mapping_counts.items():
-        best_t = max(tgt_count.items(), key=lambda x: x[1])[0]
-        mapping[s_ch] = best_t
-    return mapping
+def encode(tokens: List[str], vocab: dict, max_len: int) -> List[int]:
+    ids = [vocab[BOS]]
+    ids.extend(vocab.get(t, vocab[UNK]) for t in tokens[: max_len - 2])
+    ids.append(vocab[EOS])
+    if len(ids) < max_len:
+        ids.extend([vocab[PAD]] * (max_len - len(ids)))
+    return ids
 
 
-def translate_with_mapping(
-    src_text: str,
-    exact_map: Dict[str, str],
-    char_map: Dict[str, str],
-    default_tgt_char: str,
-) -> str:
-    if src_text in exact_map:
-        return exact_map[src_text]
-    out = []
-    for ch in src_text:
-        if not ch.strip():
-            continue
-        out.append(char_map.get(ch, default_tgt_char))
-    return "".join(out)
+class ParallelDataset(Dataset):
+    def __init__(
+        self,
+        pairs: List[Tuple[str, str]],
+        src_vocab: dict,
+        tgt_vocab: dict,
+        max_src_len: int,
+        max_tgt_len: int,
+    ) -> None:
+        self.items = []
+        for src_text, tgt_text in pairs:
+            src_ids = encode(tokenize_zh(src_text), src_vocab, max_src_len)
+            tgt_ids = encode(tokenize_ug(tgt_text), tgt_vocab, max_tgt_len)
+            self.items.append((torch.tensor(src_ids), torch.tensor(tgt_ids)))
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        return self.items[idx]
 
 
-def char_overlap_score(pred: str, gold: str) -> float:
-    pred_chars = [c for c in pred if c.strip()]
-    gold_chars = [c for c in gold if c.strip()]
-    if not pred_chars or not gold_chars:
-        return 0.0
-    pred_counter = Counter(pred_chars)
-    gold_counter = Counter(gold_chars)
-    hit = sum(min(pred_counter[k], gold_counter[k]) for k in pred_counter)
-    p = hit / max(len(pred_chars), 1)
-    r = hit / max(len(gold_chars), 1)
-    if p + r == 0:
-        return 0.0
-    return 2 * p * r / (p + r)
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512) -> None:
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[:, : x.size(1), :]
 
 
-def main() -> None:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="ignore")
+class Seq2SeqTransformer(nn.Module):
+    def __init__(
+        self,
+        src_vocab_size: int,
+        tgt_vocab_size: int,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_encoder_layers: int = 3,
+        num_decoder_layers: int = 3,
+        dim_feedforward: int = 1024,
+        dropout: float = 0.1,
+        max_len: int = 256,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.src_emb = nn.Embedding(src_vocab_size, d_model)
+        self.tgt_emb = nn.Embedding(tgt_vocab_size, d_model)
+        self.pos_enc = PositionalEncoding(d_model, max_len=max_len)
+        self.transformer = nn.Transformer(
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.fc_out = nn.Linear(d_model, tgt_vocab_size)
 
-    parser = argparse.ArgumentParser(description="中文->维语 统计翻译基线模型训练（纯 Python）")
-    parser.add_argument("--data-path", type=str, default="data/zh_ug_parallel.tsv")
-    parser.add_argument("--output-dir", type=str, default="artifacts")
-    parser.add_argument("--max-samples", type=int, default=0, help="0 表示全量数据")
-    parser.add_argument("--val-ratio", type=float, default=0.05)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "gpu", "cuda"])
-    parser.add_argument("--disable-exact-map", action="store_true", help="禁用整句记忆映射")
-    args = parser.parse_args()
+    def forward(
+        self,
+        src: torch.Tensor,
+        tgt_input: torch.Tensor,
+        src_key_padding_mask: torch.Tensor,
+        tgt_key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        src_emb = self.pos_enc(self.src_emb(src) * math.sqrt(self.d_model))
+        tgt_emb = self.pos_enc(self.tgt_emb(tgt_input) * math.sqrt(self.d_model))
+        tgt_len = tgt_input.size(1)
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_len).to(tgt_input.device)
+        out = self.transformer(
+            src=src_emb,
+            tgt=tgt_emb,
+            tgt_mask=tgt_mask,
+            src_key_padding_mask=src_key_padding_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        return self.fc_out(out)
 
-    if args.device in ("gpu", "cuda"):
-        print("提示: 当前脚本为统计基线实现，不使用 GPU，实际仍为 CPU 训练。")
 
-    random.seed(args.seed)
-    data_path = Path(args.data_path)
-    output_dir = Path(args.output_dir)
+@dataclass
+class TrainConfig:
+    data_path: str
+    output_dir: str
+    max_samples: int
+    max_src_len: int
+    max_tgt_len: int
+    min_freq: int
+    val_ratio: float
+    batch_size: int
+    epochs: int
+    lr: float
+    d_model: int
+    nhead: int
+    num_layers: int
+    ff_dim: int
+    dropout: float
+    seed: int
+    device: str
+
+
+def resolve_device(device_arg: str) -> torch.device:
+    arg = device_arg.lower().strip()
+    if arg in ("gpu", "cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("GPU requested but CUDA is not available. Check torch CUDA installation.")
+        return torch.device("cuda")
+    if arg == "cpu":
+        return torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def run_training(cfg: TrainConfig) -> None:
+    set_seed(cfg.seed)
+    device = resolve_device(cfg.device)
+
+    data_path = Path(cfg.data_path)
+    output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    pairs = load_parallel_data(data_path, args.max_samples)
+    pairs = load_parallel_data(data_path, cfg.max_samples)
     if len(pairs) < 100:
-        raise ValueError(f"样本太少: {len(pairs)}，请检查数据。")
+        raise ValueError(f"Too few samples: {len(pairs)}")
 
     random.shuffle(pairs)
-    split_idx = int(len(pairs) * (1 - args.val_ratio))
+    split_idx = int(len(pairs) * (1 - cfg.val_ratio))
     train_pairs = pairs[:split_idx]
     val_pairs = pairs[split_idx:]
 
-    mapping_counts, default_tgt_char = build_char_mapping(train_pairs)
-    char_map = best_mapping(mapping_counts)
-    exact_map = {} if args.disable_exact_map else {s: t for s, t in train_pairs}
+    src_tokens = [tokenize_zh(s) for s, _ in train_pairs]
+    tgt_tokens = [tokenize_ug(t) for _, t in train_pairs]
+    src_vocab = build_vocab(src_tokens, min_freq=cfg.min_freq)
+    tgt_vocab = build_vocab(tgt_tokens, min_freq=cfg.min_freq)
+    src_pad_id = src_vocab[PAD]
+    tgt_pad_id = tgt_vocab[PAD]
 
-    scores: List[float] = []
-    for src, tgt in val_pairs:
-        pred = translate_with_mapping(src, exact_map, char_map, default_tgt_char)
-        scores.append(char_overlap_score(pred, tgt))
-    avg_score = sum(scores) / max(len(scores), 1)
+    train_ds = ParallelDataset(train_pairs, src_vocab, tgt_vocab, cfg.max_src_len, cfg.max_tgt_len)
+    val_ds = ParallelDataset(val_pairs, src_vocab, tgt_vocab, cfg.max_src_len, cfg.max_tgt_len)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
 
-    model = {
-        "type": "char_mapping_baseline",
-        "data_path": str(data_path),
-        "train_size": len(train_pairs),
-        "val_size": len(val_pairs),
-        "val_char_f1_like": round(avg_score, 6),
-        "default_tgt_char": default_tgt_char,
-        "char_map": char_map,
-        "exact_map": exact_map,
-    }
+    model = Seq2SeqTransformer(
+        src_vocab_size=len(src_vocab),
+        tgt_vocab_size=len(tgt_vocab),
+        d_model=cfg.d_model,
+        nhead=cfg.nhead,
+        num_encoder_layers=cfg.num_layers,
+        num_decoder_layers=cfg.num_layers,
+        dim_feedforward=cfg.ff_dim,
+        dropout=cfg.dropout,
+        max_len=max(cfg.max_src_len, cfg.max_tgt_len),
+    ).to(device)
 
-    model_path = output_dir / "char_mapping_model.json"
-    with model_path.open("w", encoding="utf-8") as f:
-        json.dump(model, f, ensure_ascii=False)
+    if device.type == "cuda":
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("Using CPU")
 
-    print(f"训练完成，模型已保存: {model_path}")
-    print(f"训练集: {len(train_pairs)}  验证集: {len(val_pairs)}")
-    print(f"验证集字符级 F1-like: {avg_score:.4f}")
+    criterion = nn.CrossEntropyLoss(ignore_index=tgt_pad_id)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+
+    best_val_loss = float("inf")
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        train_loss = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{cfg.epochs} [train]")
+        for src, tgt in pbar:
+            src = src.to(device)
+            tgt = tgt.to(device)
+            tgt_input = tgt[:, :-1]
+            tgt_output = tgt[:, 1:]
+            src_key_padding_mask = src.eq(src_pad_id)
+            tgt_key_padding_mask = tgt_input.eq(tgt_pad_id)
+            logits = model(src, tgt_input, src_key_padding_mask, tgt_key_padding_mask)
+            loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            train_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+        avg_train_loss = train_loss / max(len(train_loader), 1)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for src, tgt in val_loader:
+                src = src.to(device)
+                tgt = tgt.to(device)
+                tgt_input = tgt[:, :-1]
+                tgt_output = tgt[:, 1:]
+                src_key_padding_mask = src.eq(src_pad_id)
+                tgt_key_padding_mask = tgt_input.eq(tgt_pad_id)
+                logits = model(src, tgt_input, src_key_padding_mask, tgt_key_padding_mask)
+                loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
+                val_loss += loss.item()
+        avg_val_loss = val_loss / max(len(val_loader), 1)
+
+        print(f"Epoch {epoch}: train_loss={avg_train_loss:.4f}, val_loss={avg_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "src_vocab": src_vocab,
+                    "tgt_vocab": tgt_vocab,
+                    "config": cfg.__dict__,
+                },
+                output_dir / "best_model.pt",
+            )
+            print(f"Saved best model: {output_dir / 'best_model.pt'}")
+
+    print(f"Training done. Best val loss: {best_val_loss:.4f}")
+
+
+def parse_args() -> TrainConfig:
+    parser = argparse.ArgumentParser(description="Chinese -> Uyghur Transformer training")
+    parser.add_argument("--data-path", type=str, default="data/zh_ug_parallel.tsv")
+    parser.add_argument("--output-dir", type=str, default="artifacts")
+    parser.add_argument("--max-samples", type=int, default=30000, help="0 means all samples")
+    parser.add_argument("--max-src-len", type=int, default=80)
+    parser.add_argument("--max-tgt-len", type=int, default=80)
+    parser.add_argument("--min-freq", type=int, default=1)
+    parser.add_argument("--val-ratio", type=float, default=0.05)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--nhead", type=int, default=8)
+    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--ff-dim", type=int, default=1024)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "gpu", "cuda"])
+    args = parser.parse_args()
+    return TrainConfig(
+        data_path=args.data_path,
+        output_dir=args.output_dir,
+        max_samples=args.max_samples,
+        max_src_len=args.max_src_len,
+        max_tgt_len=args.max_tgt_len,
+        min_freq=args.min_freq,
+        val_ratio=args.val_ratio,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        d_model=args.d_model,
+        nhead=args.nhead,
+        num_layers=args.num_layers,
+        ff_dim=args.ff_dim,
+        dropout=args.dropout,
+        seed=args.seed,
+        device=args.device,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="ignore")
+    config = parse_args()
+    Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+    with open(Path(config.output_dir) / "train_config.json", "w", encoding="utf-8") as f:
+        json.dump(config.__dict__, f, ensure_ascii=False, indent=2)
+    run_training(config)

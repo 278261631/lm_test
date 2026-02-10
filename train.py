@@ -102,8 +102,12 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int, default=0, help="0 表示全量数据")
     parser.add_argument("--val-ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "gpu", "cuda"])
     parser.add_argument("--disable-exact-map", action="store_true", help="禁用整句记忆映射")
     args = parser.parse_args()
+
+    if args.device in ("gpu", "cuda"):
+        print("提示: 当前脚本为统计基线实现，不使用 GPU，实际仍为 CPU 训练。")
 
     random.seed(args.seed)
     data_path = Path(args.data_path)

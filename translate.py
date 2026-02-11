@@ -87,8 +87,9 @@ class Seq2SeqTransformer(nn.Module):
 def encode_src(text: str, src_vocab: dict, max_src_len: int) -> List[int]:
     tokens = tokenize_zh(text)[: max_src_len - 2]
     ids = [src_vocab[BOS]] + [src_vocab.get(t, src_vocab[UNK]) for t in tokens] + [src_vocab[EOS]]
-    if len(ids) < max_src_len:
-        ids.extend([src_vocab[PAD]] * (max_src_len - len(ids)))
+    # In inference, avoid padding to a fixed length. With batch_size=1, PyTorch's
+    # Transformer may use nested tensors and "shrink" the source length to the
+    # true (unpadded) length, which makes a fixed-length padding mask mismatch.
     return ids
 
 
